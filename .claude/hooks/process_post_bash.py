@@ -1,0 +1,12 @@
+"""
+Claude Code Hook: Post-Bash Command Validator.
+
+Validates bash commands after execution.
+"""
+
+
+def validate_post_bash_command(command: str) -> list[str]:
+    """Validate bash command after execution."""
+    issues = []
+
+    return issues

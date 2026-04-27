@@ -1,0 +1,109 @@
+{
+    "env": {"BASH_MAX_OUTPUT_LENGTH": "100000", "BASH_DEFAULT_TIMEOUT_MS": "2000000", "CLAUDE_CODE_NOTIFY": "simple"},
+    "includeCoAuthoredBy": false,
+    "permissions": {
+        "allow": [
+            "Read(//tmp/claude/tasks/**)",
+            "mcp__puppeteer__puppeteer_navigate",
+            "mcp__puppeteer__puppeteer_screenshot",
+            "mcp__puppeteer__puppeteer_click",
+            "mcp__puppeteer__puppeteer_fill",
+            "mcp__puppeteer__puppeteer_evaluate",
+            "mcp__puppeteer__puppeteer_select",
+            "mcp__puppeteer__puppeteer_hover",
+            "WebFetch",
+            "Bash(find:*)",
+            "Bash(grep:*)",
+            "Bash(rg:*)",
+            "Bash(ls:*)",
+            "Bash(cat:*)",
+            "Bash(lsof:*)",
+            "Bash(curl:*)"
+        ],
+        "deny": []
+    },
+    "enableAllProjectMcpServers": true,
+    "enabledMcpjsonServers": ["puppeteer"],
+    "hooks": {
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "WebFetch",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            },
+            {
+                "matcher": "Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            },
+            {
+                "matcher": "Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            }
+        ],
+        "Notification": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py",
+                        "async": true
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "$CLAUDE_PROJECT_DIR/.venv/bin/python3 $CLAUDE_PROJECT_DIR/.claude/hooks/process_hooks.py"
+                    }
+                ]
+            }
+        ]
+    }
+}
