@@ -1,25 +1,22 @@
-"""Paged attention — readability-first implementation.
+"""Paged attention.
 
 KV cache layout per attention layer:
     K, V: (num_blocks, block_size, num_kv_heads, head_dim)
 
-The block manager owns *which* block_id is used by which sequence; we just
-gather/scatter at known offsets.
+Per call we do:
+    1. SCATTER. Write each input token's K and V into the cache at
+       slot_mapping[i] = block_id * block_size + slot.
+    2. GATHER + SDPA. For each sequence in the batch, gather K/V via its
+       block_table and run torch.nn.functional.scaled_dot_product_attention
+       with `enable_gqa=True` so we don't materialise the kv-head expansion.
 
-Two passes for clarity rather than a fused kernel:
+For decode (q_len==1 for all seqs) we batch into a single padded SDPA call
+when B >= 8 (where per-seq launch overhead starts to dominate); below that
+the per-seq loop is faster because padding waste outweighs launch cost.
+Threshold tuned on the L=4096 sweep.
 
-    1. SCATTER. For every input token in the current step, write its K and V
-       into the KV cache at slot_mapping[i] = block_id * block_size + slot.
-
-    2. GATHER + SDPA. For each sequence in the batch, gather the K and V
-       chunks for the blocks in its block_table, slice down to seq_len, and
-       run torch.nn.functional.scaled_dot_product_attention.
-
-This is much slower than flash-attn varlen, but the data flow is obvious in
-five lines of Python — which is the whole point of the project.
-
-Sliding window: if `window` is set, gather only the last `window` KV positions.
-This is what gpt-oss's alternating layers need.
+Sliding window: gpt-oss alternates full and windowed attention. Both paths
+mask via `attn_mask` / `seq[-window:]`.
 """
 
 from __future__ import annotations
@@ -27,6 +24,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
+
+# Above this batch size, the batched padded-SDPA path is faster than the
+# per-seq Python loop. Below it the per-seq loop wins (less padding waste).
+_BATCH_THRESHOLD = 8
 
 
 @torch.no_grad()
@@ -39,40 +40,27 @@ def write_kv_cache(
 ) -> None:
     """k, v: (num_tokens, num_kv_heads, head_dim).
     {k,v}_cache: (num_blocks, block_size, num_kv_heads, head_dim).
-    slot_mapping: (num_tokens,) int64; absolute slot = block_id * block_size + slot."""
-    flat_k = k_cache.view(
-        -1, *k_cache.shape[2:]
-    )  # (num_blocks*block_size, kv_heads, head_dim)
+    slot_mapping: (num_tokens,) int64; absolute slot = block_id*block_size + slot."""
+    flat_k = k_cache.view(-1, *k_cache.shape[2:])
     flat_v = v_cache.view(-1, *v_cache.shape[2:])
     flat_k.index_copy_(0, slot_mapping, k)
     flat_v.index_copy_(0, slot_mapping, v)
 
 
-def _gather_kv_for_seq(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_ids: torch.Tensor,  # (num_blocks_for_seq,)
-    seq_len: int,
-    window: int | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Concatenate the seq's blocks, slice to seq_len. Apply sliding window if set."""
-    k = k_cache[block_ids]  # (num_blocks_for_seq, block_size, kv_heads, head_dim)
-    v = v_cache[block_ids]
-    block_size = k.shape[1]
-    k = k.reshape(-1, *k.shape[2:])[:seq_len]  # (seq_len, kv_heads, head_dim)
-    v = v.reshape(-1, *v.shape[2:])[:seq_len]
-    if window is not None and seq_len > window:
-        k = k[-window:]
-        v = v[-window:]
-    return k, v
-    _ = block_size  # silence linter; kept for readability above.
+def _pad_block_tables(
+    block_tables: list[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    """Right-pad to (B, max_blocks). Padding uses block_id=0; we mask its
+    contribution in attn_mask."""
+    max_blocks = max(bt.shape[0] for bt in block_tables)
+    B = len(block_tables)
+    padded = torch.zeros(B, max_blocks, dtype=torch.long, device=device)
+    for i, bt in enumerate(block_tables):
+        padded[i, : bt.shape[0]] = bt
+    return padded
 
 
 class PagedAttention(nn.Module):
-    """Stateless module: just packages the gather + SDPA logic. The KV cache
-    tensors live on the model and are passed in per-call so we can reuse this
-    layer across full and sliding-window heads."""
-
     def __init__(
         self,
         num_q_heads: int,
@@ -91,56 +79,117 @@ class PagedAttention(nn.Module):
             "GQA: num_q_heads must be divisible by num_kv_heads"
         )
         self.gqa_groups = num_q_heads // num_kv_heads
+        self._enable_gqa = self.gqa_groups > 1
 
     def forward(
         self,
-        q: torch.Tensor,  # (num_tokens, num_q_heads, head_dim)
-        k: torch.Tensor,  # (num_tokens, num_kv_heads, head_dim)
+        q: torch.Tensor,
+        k: torch.Tensor,
         v: torch.Tensor,
-        k_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_dim)
+        k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,  # (num_tokens,)
-        block_tables: list[torch.Tensor],  # per-seq block IDs
-        seq_lens: torch.Tensor,  # (batch_size,) total length AFTER this step's writes
-        query_lens: torch.Tensor,  # (batch_size,) tokens contributed by this step (1 in decode, prompt_len in prefill)
+        slot_mapping: torch.Tensor,
+        block_tables: list[torch.Tensor],
+        seq_lens: torch.Tensor,
+        query_lens: torch.Tensor,
         is_prefill: bool,
     ) -> torch.Tensor:
         write_kv_cache(k, v, k_cache, v_cache, slot_mapping)
+        B = len(block_tables)
+        if not is_prefill and B >= _BATCH_THRESHOLD:
+            return self._decode_batched(q, k_cache, v_cache, block_tables, seq_lens)
+        return self._per_seq(q, k_cache, v_cache, block_tables, seq_lens, query_lens, is_prefill)
 
+    # ----------------------------------------------------------- per-seq path
+    def _per_seq(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: list[torch.Tensor],
+        seq_lens: torch.Tensor,
+        query_lens: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
         out = torch.empty_like(q)
         offset = 0
-        for i, (block_ids, seq_len, q_len) in enumerate(
-            zip(block_tables, seq_lens.tolist(), query_lens.tolist(), strict=True)
+        for block_ids, seq_len, q_len in zip(
+            block_tables, seq_lens.tolist(), query_lens.tolist(), strict=True
         ):
             q_chunk = q[offset : offset + q_len]
             offset += q_len
+            k_seq, v_seq = self._gather(k_cache, v_cache, block_ids, seq_len)
 
-            k_seq, v_seq = _gather_kv_for_seq(
-                k_cache, v_cache, block_ids, seq_len, self.window
-            )
+            q_t = q_chunk.transpose(0, 1).unsqueeze(0)  # (1, q_heads, q_len, head_dim)
+            k_t = k_seq.transpose(0, 1).unsqueeze(0)  # (1, kv_heads, kv_len, head_dim)
+            v_t = v_seq.transpose(0, 1).unsqueeze(0)
 
-            # Promote KV heads to Q heads for GQA. SDPA in PyTorch handles GQA via
-            # `enable_gqa=True` in newer versions, but we expand manually for clarity.
-            if self.gqa_groups > 1:
-                k_seq = k_seq.repeat_interleave(self.gqa_groups, dim=1)
-                v_seq = v_seq.repeat_interleave(self.gqa_groups, dim=1)
-
-            # SDPA expects (heads, seq, head_dim) per query/key/value.
-            q_t = q_chunk.transpose(0, 1)  # (heads, q_len, head_dim)
-            k_t = k_seq.transpose(0, 1)  # (heads, kv_len, head_dim)
-            v_t = v_seq.transpose(0, 1)
-
-            # Causal masking only for prefill (q_len > 1). For decode, q_len=1 so
-            # attention to all KV positions is correct.
             attn = F.scaled_dot_product_attention(
-                q_t.unsqueeze(0),
-                k_t.unsqueeze(0),
-                v_t.unsqueeze(0),
+                q_t,
+                k_t,
+                v_t,
                 is_causal=is_prefill and q_len > 1,
                 scale=self.scale,
+                enable_gqa=self._enable_gqa,
             ).squeeze(0)  # (heads, q_len, head_dim)
 
             out[offset - q_len : offset] = attn.transpose(0, 1)
-            _ = i
-
         return out
+
+    # ----------------------------------------------------------- batched decode
+    def _decode_batched(
+        self,
+        q: torch.Tensor,  # (B, num_q_heads, head_dim) — q_len=1 per seq.
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: list[torch.Tensor],
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        device = q.device
+        B = len(block_tables)
+        block_size = k_cache.shape[1]
+        kv_heads = k_cache.shape[2]
+        head_dim = k_cache.shape[3]
+
+        padded = _pad_block_tables(block_tables, device)
+        max_blocks = padded.shape[1]
+        kv_len = max_blocks * block_size
+
+        K_full = k_cache[padded].reshape(B, kv_len, kv_heads, head_dim)
+        V_full = v_cache[padded].reshape(B, kv_len, kv_heads, head_dim)
+
+        positions = torch.arange(kv_len, device=device).unsqueeze(0)  # (1, kv_len)
+        sl = seq_lens.unsqueeze(1)
+        mask = positions < sl
+        if self.window is not None:
+            mask = mask & (positions >= sl - self.window)
+        attn_mask = mask.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, kv_len)
+
+        q_b = q.view(B, 1, self.num_q_heads, head_dim).transpose(1, 2)
+        k_b = K_full.transpose(1, 2)
+        v_b = V_full.transpose(1, 2)
+
+        attn = F.scaled_dot_product_attention(
+            q_b,
+            k_b,
+            v_b,
+            attn_mask=attn_mask,
+            is_causal=False,
+            scale=self.scale,
+            enable_gqa=self._enable_gqa,
+        )  # (B, num_q_heads, 1, head_dim)
+        return attn.squeeze(2)
+
+    def _gather(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_ids: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k = k_cache[block_ids].reshape(-1, *k_cache.shape[2:])[:seq_len]
+        v = v_cache[block_ids].reshape(-1, *v_cache.shape[2:])[:seq_len]
+        if self.window is not None and seq_len > self.window:
+            k = k[-self.window :]
+            v = v[-self.window :]
+        return k, v

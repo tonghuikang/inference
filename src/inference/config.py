@@ -25,8 +25,10 @@ class EngineConfig:
     # dedup. 64 still hits well on long shared prompts.
     num_kv_blocks: int = 1024  # Pool size; tune to GPU memory.
     gpu_memory_utilization: float = 0.85
-    max_num_seqs: int = 64  # Concurrency cap.
-    max_num_batched_tokens: int = 8192  # Per-step token budget.
+    max_num_seqs: int = 1024  # Concurrency cap. There's no fundamental limit
+    # — the engine batches every running sequence into a single forward pass.
+    # The cap just bounds memory growth from scheduler bookkeeping.
+    max_num_batched_tokens: int = 32768  # Per-step token budget for prefill admission.
     enforce_eager: bool = True  # No CUDA graphs in v1.
     kv_observer_log: Path | None = None  # If set, append KV events to this file.
 

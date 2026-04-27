@@ -6,3 +6,8 @@
 *.pyc
 *.log
 *.stderr
+
+# All .txt files are gitignored by default; saved prompts opt back in below.
+*.txt
+!prompts/*.txt
+serve.pid
