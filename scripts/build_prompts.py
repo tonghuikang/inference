@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 OUT = Path(__file__).resolve().parent.parent / "prompts"
-SIZES = [10, 100, 1000, 10000]
+SIZES = [10, 100, 1000]
 
 
 def build_lines(n: int, seed: int) -> tuple[str, list[int]]:

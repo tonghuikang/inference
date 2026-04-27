@@ -453,7 +453,7 @@ def main() -> int:
         help="Repo id; resolved against HF_HOME/hub.",
     )
     parser.add_argument("--num-kv-blocks", type=int, default=4096)
-    parser.add_argument("--block-size", type=int, default=64)
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=1024)
     parser.add_argument(
         "--kv-log", default=None, help="Optional path to append KV events."

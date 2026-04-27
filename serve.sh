@@ -20,7 +20,7 @@ nohup uv run python -m inference.server \
     --model Qwen/Qwen3-0.6B \
     --host 0.0.0.0 \
     --port $PORT \
-    --num-kv-blocks 1024 \
-    --block-size 64 \
+    --num-kv-blocks 2048 \
+    --block-size 32 \
     --kv-log ./kv_observer.log >./serve.log 2>&1 &
 echo "Server running in background (PID: $!)"

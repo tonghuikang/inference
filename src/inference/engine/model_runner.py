@@ -21,6 +21,7 @@ import torch
 
 from inference.config import EngineConfig
 
+from .context import AttentionContext, reset_context, set_context
 from .sequence import Sequence
 
 
@@ -32,6 +33,10 @@ class ModelInputs(TypedDict):
     seq_lens: torch.Tensor
     query_lens: torch.Tensor
     is_prefill: bool
+    # Precomputed per-step (so each of the 28+ attention layers doesn't redo
+    # them). None when the batched-decode path won't fire.
+    padded_block_tables: torch.Tensor | None
+    decode_attn_mask: torch.Tensor | None
 
 
 def _absolute_slot(block_id: int, slot: int, block_size: int) -> int:
@@ -76,14 +81,35 @@ def build_inputs(
         seq_lens.append(total_len)
         query_lens.append(q_len)
 
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
+
+    # Precompute the padded block-table + attn mask once per step if the
+    # batched-decode path will fire. Saves O(num_layers) Python work.
+    padded_block_tables = None
+    decode_attn_mask = None
+    if not is_prefill and len(seqs) >= 8:
+        max_seq_len = max(seq_lens)
+        if len(seqs) * max_seq_len <= 4096:
+            max_blocks = max(bt.shape[0] for bt in block_tables)
+            padded_block_tables = torch.zeros(
+                len(seqs), max_blocks, dtype=torch.long, device=device
+            )
+            for i, bt in enumerate(block_tables):
+                padded_block_tables[i, : bt.shape[0]] = bt
+            kv_len = max_blocks * block_size
+            positions_t = torch.arange(kv_len, device=device).unsqueeze(0)
+            decode_attn_mask = (positions_t < seq_lens_t.unsqueeze(1)).unsqueeze(1).unsqueeze(1)
+
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
         "positions": torch.tensor(positions, dtype=torch.long, device=device),
         "slot_mapping": torch.tensor(slot_mapping, dtype=torch.long, device=device),
         "block_tables": block_tables,
-        "seq_lens": torch.tensor(seq_lens, dtype=torch.long, device=device),
+        "seq_lens": seq_lens_t,
         "query_lens": torch.tensor(query_lens, dtype=torch.long, device=device),
         "is_prefill": is_prefill,
+        "padded_block_tables": padded_block_tables,
+        "decode_attn_mask": decode_attn_mask,
     }
 
 
@@ -98,4 +124,19 @@ class ModelRunner:
     @torch.no_grad()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor:
         inputs = build_inputs(seqs, is_prefill, self.cfg.block_size, self.device)
-        return self.model(**inputs)  # (batch, vocab)
+        ctx = AttentionContext(
+            is_prefill=inputs["is_prefill"],
+            block_tables=inputs["block_tables"],
+            seq_lens=inputs["seq_lens"],
+            query_lens=inputs["query_lens"],
+            slot_mapping=inputs["slot_mapping"],
+            padded_block_tables=inputs["padded_block_tables"],
+            decode_attn_mask=inputs["decode_attn_mask"],
+        )
+        token = set_context(ctx)
+        try:
+            return self.model(
+                input_ids=inputs["input_ids"], positions=inputs["positions"]
+            )
+        finally:
+            reset_context(token)

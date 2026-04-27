@@ -124,11 +124,15 @@ uv run --frozen ruff check src/ tests/ scripts/
 ## Throughput
 
 See `SPEED.md` for the full concurrency × prefix table compared against
-docker `vllm.service`. tl;dr at L=1 N=64 we hit ~830 tok/s on Qwen3-0.6B
-(vLLM gets ~6800); at L=4096 N=64 the gap is much wider because our
-attention is gather + SDPA in Python rather than a fused kernel
-(flash-attn / paged-attention Triton). Closing the gap requires writing or
-linking a fused decode kernel — listed as deferred work in `SPEED.md`.
+docker `vllm.service`, plus an empirical block-size sweep. tl;dr at L=1
+N=64 we hit ~1100 tok/s on Qwen3-0.6B (vLLM gets ~6800, so 6×). At
+L=4096 N=64 the gap is wider (~37×) because our attention is gather +
+SDPA in Python rather than a fused kernel (flash-attn varlen, paged-
+attention Triton). Closing the long-prefix gap is the remaining work,
+listed in `SPEED.md`.
+
+Default config: `block_size=32`, `num_kv_blocks=2048`, `max_num_seqs=1024`.
+Sweep showed `block_size=32` beats both 16 (slightly) and 64 (~30-50%).
 
 ## Features (mapped to requirements)
 

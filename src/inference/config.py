@@ -20,10 +20,12 @@ class ModelConfig:
 class EngineConfig:
     """Global engine config; one instance shared across loaded models."""
 
-    block_size: int = 64  # Tokens per KV block. Larger blocks = fewer cells in
-    # the observer grid (more legible) at the cost of less granular prefix
-    # dedup. 64 still hits well on long shared prompts.
-    num_kv_blocks: int = 1024  # Pool size; tune to GPU memory.
+    block_size: int = 32  # Tokens per KV block. Empirically tuned (see
+    # SPEED.md§"Block size sweep"): 32 wins by ~30-50% over 64/128 on
+    # decode throughput because it lets more cells hit the batched-decode
+    # fast path (B * max_seq_len <= 4096). 16 is close behind 32; 64+
+    # leaves a lot on the table for our pure-Python attention.
+    num_kv_blocks: int = 2048  # Pool size; tune to GPU memory.
     gpu_memory_utilization: float = 0.85
     max_num_seqs: int = 1024  # Concurrency cap. There's no fundamental limit
     # — the engine batches every running sequence into a single forward pass.

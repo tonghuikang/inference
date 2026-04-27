@@ -29,22 +29,28 @@ hardware that runs the docker `vllm.service`. Same harness as
 
 ### Ours — `inference.server` with Qwen3-0.6B (pure-Python paged attention)
 
-After applying: native GQA in SDPA (`enable_gqa=True`); cached
-`block_table_tensor` on `Sequence`; conditional batched-decode SDPA when
-`B >= 8 AND B * max_seq_len <= 4096`.
+Applied:
+- `enable_gqa=True` in SDPA (drops `repeat_interleave` of K/V).
+- Cached `block_table_tensor` on each `Sequence` (rebuild only when block
+  count changes, ~once per `block_size` decode steps).
+- Conditional batched-decode SDPA when `B >= 8 AND B * max_seq_len <= 4096`.
+- Per-step attention metadata (padded block tables, attn mask) computed once
+  in `model_runner` and passed via a `contextvar` so each of the 28 layers
+  doesn't recompute.
 
 | prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 |  N=256 |  N=1024 | prefill (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 |  67 | 202 | 454 | 832 |   —  |   —  | 0.02 |
-|  4096 |  46 |  89 | 114 | 104 |   —  |   —  | 0.29 |
-| 32768 |   — |   — |   — |   — |   —  |   —  |   —  |
-| 98304 |   — |   — |   — |   — |   —  |   —  |   —  |
+|     1 |  70 | 234 | 558 | 1116 |   —  |   —  | 0.02 |
+|  4096 |  47 |  92 | 120 |  105 |   —  |   —  | 0.27 |
+| 32768 |   — |   — |   — |   —  |   —  |   —  |   —  |
+| 98304 |   — |   — |   — |   —  |   —  |   —  |   —  |
 
 Cells past N=64 and L>=32768 not yet measured — pure-Python prefill at
-those scales takes minutes-to-hours per cell with our current attention.
+those scales takes minutes-to-hours per cell with the current attention.
 
-(For reference, pre-optimisation numbers were 67/206/403/**572** at L=1
-and 34/54/62/**26** at L=4096; L=4096 N=64 alone went up 4×.)
+Pre-optimisation v1 numbers (for reference): 67 / 206 / 403 / **572** at
+L=1 and 34 / 54 / 62 / **26** at L=4096. L=1 N=64 went up 1.95× (572 →
+1116); L=4096 N=64 went up 4× (26 → 105).
 
 ### vLLM (Qwen3-0.6B) — same model, fused kernels
 
@@ -64,19 +70,21 @@ and 34/54/62/**26** at L=4096; L=4096 N=64 alone went up 4×.)
 | 32768 |   — |   — |   — |   — |   —  |   —  |   —  |
 | 98304 |   — |   — |   — |   — |   —  |   —  |   —  |
 
-## What the gap looks like (after v5 optimisations)
+## What the gap looks like (after the optimisations above)
 
 vLLM-Qwen3 / Ours-Qwen3, same model, same hardware:
 
 | prefix tokens |  N=1 |  N=4 | N=16 | N=64 | prefill |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 | 1.9× | 3.0× |  4.6× |  8.2× | ~2× |
-|  4096 | 2.1× | 4.6× | 10.8× | 36.9× | ~2.4× |
+|     1 | 1.8× | 2.6× |  3.8× |  6.1× | ~2× |
+|  4096 | 2.1× | 4.4× | 10.3× | 36.5× | ~2.3× |
 
-We're 2-3× slower at concurrency 1 (Python+launch overhead per step). The
-gap widens with concurrency at long prefix because vLLM has fused paged
-attention while ours is gather + SDPA. L=4096 N=64 went from a 147× gap
-in v1 to a 37× gap in v5.
+Gap closed from 147× → 37× on the worst cell (L=4096 N=64) and from 12× →
+6.1× on L=1 N=64. We're now ~2× slower than vLLM on the easy cells, ~10×
+on long-prefix concurrent decode. The remaining gap is the lack of a
+fused PagedAttention kernel — gather + SDPA is fundamentally bandwidth-
+bound on K/V reads, while vLLM's kernel overlaps gather with attention
+math at register speed.
 
 ## Why we're slow
 
@@ -177,24 +185,38 @@ case. Before any of (1-5) lands:
 - Throughput regression harness — wire `bench.py` cells into pytest with
   a `--bench` flag, ±15% bands against a stored baseline.
 
-## Block size
+## Block size sweep
 
-Currently `block_size = 64` (was 16, vLLM/nano-vllm default). For our
-implementation, 64 (or even 128) is roughly right because every decode
-step pays a Python-level `torch.tensor(seq.block_table, …)` build plus
-one CUDA kernel launch per `k_cache[block_ids]` gather; both costs scale
-with `len(block_table)`, not with tokens. Cutting block count 4× (16 → 64)
-removes ~12k host→device transfers per decode step at N=64 L=4096.
+Empirical sweep across `block_size ∈ {16, 32, 64, 128}` on the same
+hardware, same engine code, same bench harness (`scripts/bench.py` with
+`BENCH_PREFIX=1,1024 BENCH_CONC=1,16,64`). Cell value is decode tok/s.
 
-vLLM uses 16 because their fused PagedAttention strides through blocks at
-register speed — block count cost is free for them, so finer dedup wins.
-For us it's the opposite. The picture flips back to 16 the moment we land
-fix (1) above.
+| block_size |   L=1 N=1 |  L=1 N=16 |  L=1 N=64 | L=1024 N=1 | L=1024 N=16 | L=1024 N=64 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16  | 71 | 663 | 1251 | 67 | 318 | 402 |
+| **32**  | **73** | **694** | **1315** | **69** | **330** | **413** |
+| 64  | 71 | 556 |  907 | 65 | 309 | 398 |
+| 128 | 73 | 449 |  598 | 64 | 306 | 392 |
 
-Dedup loss from 16→64: a shared prefix of P tokens still caches
-`floor(P/64)` blocks; for P ≥ 128 we lose at most one trailing block of
-dedup. Knobs that flip the answer: many short shared prefixes (P < 64)
-favour smaller blocks; very high N·L favours larger.
+**Winner: `block_size=32`.** Beats 64 by ~45% on L=1 N=64 (1315 vs 907)
+and stays within noise of 16 on the cells where it doesn't lead.
+
+The original first-principles analysis (subagent) predicted 64+ should
+win because "every decode step pays a Python kernel launch per block".
+The empirical answer disagrees: at small `block_size`, more sequences
+hit the batched-decode fast path (gated on `B * max_seq_len <= 4096`),
+which more than compensates for any per-block overhead. The crossover
+is sharp — 32 → 64 drops L=1 N=64 by 30%.
+
+Switched the default to `block_size=32` (`config.py`, `serve.sh`,
+`server.py`).
+
+Knobs that change the picture:
+- The batched-decode threshold (`_BATCH_KV_THRESHOLD=4096` in
+  `attention.py`). Raising it lets bs=64 stay batched on more cells.
+- Long-prefix workloads (L>=4096) flatten the curve — at L=4096 N=64 the
+  batched path is off regardless of bs, so all four bs values converge.
+- Prefix-dedup hit rate: smaller bs catches finer prefixes.
 
 ## YaRN extended context
 

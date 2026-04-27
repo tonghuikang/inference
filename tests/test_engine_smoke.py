@@ -84,6 +84,7 @@ def test_tiny_qwen3_prefill_decode():
 def test_paged_attention_matches_unpaged_reference():
     """Sanity check: gather-then-SDPA matches the same SDPA on a plain dense
     K/V tensor. Tiny shapes, fp32, tight tolerance."""
+    from inference.engine.context import AttentionContext, reset_context, set_context
     from inference.layers.attention import PagedAttention
 
     torch.manual_seed(0)
@@ -111,18 +112,19 @@ def test_paged_attention_matches_unpaged_reference():
     slot_mapping = torch.arange(seq_len, dtype=torch.long, device=device)
 
     attn = PagedAttention(num_q_heads, num_kv_heads, head_dim).to(device).to(dtype)
-    out = attn(
-        q,
-        k,
-        v,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        [block_table],
-        seq_lens=torch.tensor([seq_len], device=device),
-        query_lens=torch.tensor([seq_len], device=device),
-        is_prefill=True,
+    token = set_context(
+        AttentionContext(
+            is_prefill=True,
+            block_tables=[block_table],
+            seq_lens=torch.tensor([seq_len], device=device),
+            query_lens=torch.tensor([seq_len], device=device),
+            slot_mapping=slot_mapping,
+        )
     )
+    try:
+        out = attn(q, k, v, k_cache, v_cache)
+    finally:
+        reset_context(token)
 
     ref = (
         torch.nn.functional.scaled_dot_product_attention(

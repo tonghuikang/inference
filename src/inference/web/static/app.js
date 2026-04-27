@@ -241,7 +241,6 @@ async function streamChat(prompt, max_tokens, label) {
   const { head, body } = newRunCard(`#${id} ${label} starting…`);
   const t0 = performance.now();
   let firstTokenAt = null;
-  let n_chars = 0;
   let n_chunks = 0;
   try {
     const res = await fetch('/v1/chat/completions', {
@@ -275,7 +274,6 @@ async function streamChat(prompt, max_tokens, label) {
           if (delta) {
             if (firstTokenAt === null) firstTokenAt = performance.now();
             body.textContent += delta;
-            n_chars += delta.length;
             n_chunks++;
           }
         } catch (_) { /* ignore malformed chunk */ }

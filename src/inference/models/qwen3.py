@@ -85,11 +85,6 @@ class Qwen3Attention(nn.Module):
         rotary: RotaryEmbedding,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_tables: list[torch.Tensor],
-        seq_lens: torch.Tensor,
-        query_lens: torch.Tensor,
-        is_prefill: bool,
     ) -> torch.Tensor:
         n_tok = hidden.shape[0]
         q = self.q_proj(hidden).view(n_tok, self.num_q, self.head_dim)
@@ -98,18 +93,7 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = rotary(q, k, positions)
-        attn_out = self.attn(
-            q,
-            k,
-            v,
-            k_cache,
-            v_cache,
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            query_lens,
-            is_prefill,
-        )
+        attn_out = self.attn(q, k, v, k_cache, v_cache)
         return self.o_proj(attn_out.reshape(n_tok, self.num_q * self.head_dim))
 
 
@@ -139,23 +123,9 @@ class Qwen3DecoderLayer(nn.Module):
         rotary: RotaryEmbedding,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_tables: list[torch.Tensor],
-        seq_lens: torch.Tensor,
-        query_lens: torch.Tensor,
-        is_prefill: bool,
     ) -> torch.Tensor:
         h = self.self_attn(
-            self.input_layernorm(hidden),
-            positions,
-            rotary,
-            k_cache,
-            v_cache,
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            query_lens,
-            is_prefill,
+            self.input_layernorm(hidden), positions, rotary, k_cache, v_cache
         )
         hidden = hidden + h
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
@@ -211,31 +181,18 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_tables: list[torch.Tensor],
-        seq_lens: torch.Tensor,
-        query_lens: torch.Tensor,
-        is_prefill: bool,
     ) -> torch.Tensor:
+        from inference.engine.context import get_context
+
+        ctx = get_context()
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = self.kv_for_layer(i)
-            hidden = layer(
-                hidden,
-                positions,
-                self.rotary,
-                k_cache,
-                v_cache,
-                slot_mapping,
-                block_tables,
-                seq_lens,
-                query_lens,
-                is_prefill,
-            )
+            hidden = layer(hidden, positions, self.rotary, k_cache, v_cache)
         hidden = self.norm(hidden)
 
         # We only need the LAST query token of each sequence to sample.
-        last_idx = torch.cumsum(query_lens, dim=0) - 1
+        last_idx = torch.cumsum(ctx.query_lens, dim=0) - 1
         last_hidden = hidden[last_idx]
 
         weight = (
