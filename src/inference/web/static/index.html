@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KV cache observer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>KV cache observer</h1>
+  <div id="meta">
+    <span id="model-id">…</span>
+    &nbsp;|&nbsp; block_size <span id="block-size">…</span>
+    &nbsp;|&nbsp; <span id="block-count">…</span> blocks
+    &nbsp;|&nbsp; free <span id="free-count">…</span>
+    &nbsp;|&nbsp; shared <span id="shared-count">…</span>
+  </div>
+  <div id="legend">
+    <span class="swatch free"></span>free
+    <span class="swatch evictable"></span>evictable (cached, ref=0)
+    <span class="swatch owned"></span>owned
+    <span class="swatch shared"></span>shared
+    <span class="swatch flash"></span>just evicted
+  </div>
+</header>
+<main>
+  <section id="left">
+    <div id="grid"></div>
+    <div id="panel">
+      <div id="buttons">
+        <button class="demo" data-demo="10">10 lines</button>
+        <button class="demo" data-demo="100">100 lines</button>
+        <button class="demo" data-demo="1000">1000 lines</button>
+        <button class="demo" data-demo="10000">10000 lines</button>
+        <button class="demo secondary" data-demo="shared">shared-prefix pair</button>
+        <span id="chat-status"></span>
+      </div>
+      <div id="chat-output"></div>
+    </div>
+  </section>
+  <aside id="detail">
+    <h2>block</h2>
+    <div id="detail-empty">hover or click a block</div>
+    <dl id="detail-fields" hidden>
+      <dt>id</dt><dd id="d-id"></dd>
+      <dt>refcount</dt><dd id="d-refcount"></dd>
+      <dt>hash</dt><dd id="d-hash"></dd>
+      <dt>owners</dt><dd id="d-owners"></dd>
+      <dt>text</dt><dd id="d-text">click to decode</dd>
+      <dt>tokens</dt><dd id="d-tokens"></dd>
+    </dl>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
