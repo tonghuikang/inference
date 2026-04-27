@@ -27,30 +27,37 @@ hardware that runs the docker `vllm.service`. Same harness as
 
 ## Results
 
-### Ours — `inference.server` with Qwen3-0.6B (pure-Python paged attention)
+### Ours — `inference.server` with Qwen3-0.6B (Triton paged-attention)
 
 Applied:
-- `enable_gqa=True` in SDPA (drops `repeat_interleave` of K/V).
+- `enable_gqa=True` in SDPA (drops `repeat_interleave` of K/V) — prefill path.
 - Cached `block_table_tensor` on each `Sequence` (rebuild only when block
   count changes, ~once per `block_size` decode steps).
-- Conditional batched-decode SDPA when `B >= 8 AND B * max_seq_len <= 4096`.
-- Per-step attention metadata (padded block tables, attn mask) computed once
-  in `model_runner` and passed via a `contextvar` so each of the 28 layers
+- Per-step attention metadata (padded block tables) computed once in
+  `model_runner` and passed via a `contextvar` so each of the 28 layers
   doesn't recompute.
+- **Custom Triton paged-attention decode kernel** (`layers/paged_attn_triton.py`)
+  — one launch per layer covers all `(B, num_q_heads)` outputs with online-
+  softmax accumulation, native GQA, and optional sliding window. Replaces
+  the per-seq SDPA loop on every decode step.
 
 | prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 |  N=256 |  N=1024 | prefill (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 |  70 | 234 | 558 | 1116 |   —  |   —  | 0.02 |
-|  4096 |  47 |  92 | 120 |  105 |   —  |   —  | 0.27 |
+|     1 |  63 | 295 | 898 | 1910 |   —  |   —  | 0.02 |
+|  4096 |  37 | 132 | 246 |  191 |   —  |   —  | 0.28 |
 | 32768 |   — |   — |   — |   —  |   —  |   —  |   —  |
 | 98304 |   — |   — |   — |   —  |   —  |   —  |   —  |
 
-Cells past N=64 and L>=32768 not yet measured — pure-Python prefill at
-those scales takes minutes-to-hours per cell with the current attention.
+Triton kernel improvements vs the pre-Triton SDPA build:
+- L=1 N=64: 1116 → **1910** tok/s (1.7× speedup).
+- L=4096 N=16: 120 → **246** tok/s (2.0× speedup).
+- L=4096 N=64: 105 → **191** tok/s (1.8× speedup).
+- L=4096 N=1: 47 → 37 (~20% regression — kernel has launch overhead at
+  B=1 with many blocks; SDPA per-seq path remains a fallback option).
 
-Pre-optimisation v1 numbers (for reference): 67 / 206 / 403 / **572** at
-L=1 and 34 / 54 / 62 / **26** at L=4096. L=1 N=64 went up 1.95× (572 →
-1116); L=4096 N=64 went up 4× (26 → 105).
+End-to-end vs the v1 starting point:
+- L=1 N=64: 572 → **1910** tok/s (3.34× faster).
+- L=4096 N=64: 26 → **191** tok/s (7.35× faster).
 
 ### vLLM (Qwen3-0.6B) — same model, fused kernels
 
@@ -76,15 +83,16 @@ vLLM-Qwen3 / Ours-Qwen3, same model, same hardware:
 
 | prefix tokens |  N=1 |  N=4 | N=16 | N=64 | prefill |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 | 1.8× | 2.6× |  3.8× |  6.1× | ~2× |
-|  4096 | 2.1× | 4.4× | 10.3× | 36.5× | ~2.3× |
+|     1 | 2.0× | 2.1× |  2.3× |  3.6× | ~2× |
+|  4096 | 2.6× | 3.1× |  5.0× | 20.1× | ~2.4× |
 
-Gap closed from 147× → 37× on the worst cell (L=4096 N=64) and from 12× →
-6.1× on L=1 N=64. We're now ~2× slower than vLLM on the easy cells, ~10×
-on long-prefix concurrent decode. The remaining gap is the lack of a
-fused PagedAttention kernel — gather + SDPA is fundamentally bandwidth-
-bound on K/V reads, while vLLM's kernel overlaps gather with attention
-math at register speed.
+Gap progression on the worst cell (L=4096 N=64): **147× → 37× → 20×**.
+On L=1 N=64: **12× → 6.1× → 3.6×**. We're now within ~2× of vLLM on the
+easy decode cells. The remaining 20× at L=4096 N=64 mostly comes from
+vLLM's CUDA-graph capture (we don't capture; each decode step pays full
+kernel launch overhead × 28 layers). Closing it requires `torch.compile`
+with static shapes — bucket the decode batch size + pad block tables to
+fixed lengths so Inductor can capture.
 
 ## Why we're slow
 

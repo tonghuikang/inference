@@ -61,6 +61,14 @@ class LlmEngine:
         self.model.to(self.device).to(torch.bfloat16)
         self.model.eval()
 
+        # Compile each decoder layer with mode="default" — reduce-overhead/
+        # CUDA-graph capture would require static shapes that we don't have
+        # (num_tokens varies per step, block_tables are dynamic). Default
+        # mode still gets us inductor-fused linears + RMSNorm + RoPE.
+        if not engine_cfg.enforce_eager:
+            for layer in self.model.layers:
+                layer.compile(mode="default", dynamic=True)
+
         self.block_mgr = BlockManager(
             num_blocks=engine_cfg.num_kv_blocks,
             block_size=engine_cfg.block_size,

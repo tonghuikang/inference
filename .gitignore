@@ -11,3 +11,5 @@
 *.txt
 !prompts/*.txt
 serve.pid
+flash_attn_build.log
+flash_attn_build.pid

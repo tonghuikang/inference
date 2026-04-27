@@ -83,22 +83,20 @@ def build_inputs(
 
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
 
-    # Precompute the padded block-table + attn mask once per step if the
-    # batched-decode path will fire. Saves O(num_layers) Python work.
+    # For decode steps we ALWAYS build a padded block-table and route attention
+    # through the fused Triton kernel — one launch per layer covers all
+    # (B, num_q_heads) outputs at any B and any seq_len. The old SDPA-based
+    # `decode_attn_mask` is no longer needed (the kernel handles masking
+    # internally via seq_lens).
     padded_block_tables = None
     decode_attn_mask = None
-    if not is_prefill and len(seqs) >= 8:
-        max_seq_len = max(seq_lens)
-        if len(seqs) * max_seq_len <= 4096:
-            max_blocks = max(bt.shape[0] for bt in block_tables)
-            padded_block_tables = torch.zeros(
-                len(seqs), max_blocks, dtype=torch.long, device=device
-            )
-            for i, bt in enumerate(block_tables):
-                padded_block_tables[i, : bt.shape[0]] = bt
-            kv_len = max_blocks * block_size
-            positions_t = torch.arange(kv_len, device=device).unsqueeze(0)
-            decode_attn_mask = (positions_t < seq_lens_t.unsqueeze(1)).unsqueeze(1).unsqueeze(1)
+    if not is_prefill:
+        max_blocks = max(bt.shape[0] for bt in block_tables)
+        padded_block_tables = torch.zeros(
+            len(seqs), max_blocks, dtype=torch.long, device=device
+        )
+        for i, bt in enumerate(block_tables):
+            padded_block_tables[i, : bt.shape[0]] = bt
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),

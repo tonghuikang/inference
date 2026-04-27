@@ -25,6 +25,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from inference.engine.context import get_context
+from inference.layers.paged_attn_triton import paged_decode_attn
 
 
 @torch.no_grad()
@@ -72,8 +73,19 @@ class PagedAttention(nn.Module):
     ) -> torch.Tensor:
         ctx = get_context()
         write_kv_cache(k, v, k_cache, v_cache, ctx.slot_mapping)
+        # Decode path: use the Triton fused paged-attention kernel. One launch
+        # per layer covers all (B, num_q_heads) outputs, matching the shape of
+        # nano-vllm's flash_attn_with_kvcache call.
         if not ctx.is_prefill and ctx.padded_block_tables is not None:
-            return self._decode_batched(q, k_cache, v_cache, ctx)
+            return paged_decode_attn(
+                q,
+                k_cache,
+                v_cache,
+                ctx.padded_block_tables,
+                ctx.seq_lens,
+                self.scale,
+                self.window or 0,
+            )
         return self._per_seq(q, k_cache, v_cache, ctx)
 
     # ----------------------------------------------------------- per-seq path
