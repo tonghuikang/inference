@@ -25,9 +25,15 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
-# Above this batch size, the batched padded-SDPA path is faster than the
-# per-seq Python loop. Below it the per-seq loop wins (less padding waste).
-_BATCH_THRESHOLD = 8
+# Use the batched padded-SDPA decode path only when total KV traffic stays
+# below this many tokens (B * max_kv_len). Above it the per-seq SDPA path
+# wins because the padded approach materialises a big (B, kv_len, ...)
+# tensor and the per-seq path doesn't. Tuned empirically:
+#   - L=1 N=64 (B*kv_len ≈ 64): batched is ~3× faster.
+#   - L=4096 N=16 (B*kv_len ≈ 65k): batched is ~3× SLOWER.
+# So 4096 is a safe threshold.
+_BATCH_KV_THRESHOLD = 4096
+_MIN_BATCH_SIZE = 8
 
 
 @torch.no_grad()
@@ -96,9 +102,13 @@ class PagedAttention(nn.Module):
     ) -> torch.Tensor:
         write_kv_cache(k, v, k_cache, v_cache, slot_mapping)
         B = len(block_tables)
-        if not is_prefill and B >= _BATCH_THRESHOLD:
-            return self._decode_batched(q, k_cache, v_cache, block_tables, seq_lens)
-        return self._per_seq(q, k_cache, v_cache, block_tables, seq_lens, query_lens, is_prefill)
+        if not is_prefill and B >= _MIN_BATCH_SIZE:
+            max_seq_len = int(seq_lens.max().item())
+            if B * max_seq_len <= _BATCH_KV_THRESHOLD:
+                return self._decode_batched(q, k_cache, v_cache, block_tables, seq_lens)
+        return self._per_seq(
+            q, k_cache, v_cache, block_tables, seq_lens, query_lens, is_prefill
+        )
 
     # ----------------------------------------------------------- per-seq path
     def _per_seq(

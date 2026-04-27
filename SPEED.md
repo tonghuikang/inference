@@ -29,37 +29,54 @@ hardware that runs the docker `vllm.service`. Same harness as
 
 ### Ours — `inference.server` with Qwen3-0.6B (pure-Python paged attention)
 
-| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 | prefill (s) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 |  67 | 206 | 403 | 572 | 0.02 |
-|  4096 |  34 |  54 |  62 |  26 | 0.28 |
+After applying: native GQA in SDPA (`enable_gqa=True`); cached
+`block_table_tensor` on `Sequence`; conditional batched-decode SDPA when
+`B >= 8 AND B * max_seq_len <= 4096`.
+
+| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 |  N=256 |  N=1024 | prefill (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+|     1 |  67 | 202 | 454 | 832 |   —  |   —  | 0.02 |
+|  4096 |  46 |  89 | 114 | 104 |   —  |   —  | 0.29 |
+| 32768 |   — |   — |   — |   — |   —  |   —  |   —  |
+| 98304 |   — |   — |   — |   — |   —  |   —  |   —  |
+
+Cells past N=64 and L>=32768 not yet measured — pure-Python prefill at
+those scales takes minutes-to-hours per cell with our current attention.
+
+(For reference, pre-optimisation numbers were 67/206/403/**572** at L=1
+and 34/54/62/**26** at L=4096; L=4096 N=64 alone went up 4×.)
 
 ### vLLM (Qwen3-0.6B) — same model, fused kernels
 
-| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 | prefill (s) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 | 128 | 611 | 2100 | 6830 | 0.01 |
-|  4096 |  98 | 408 | 1232 | 3836 | 0.12 |
+| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 |  N=256 |  N=1024 | prefill (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+|     1 | 128 | 611 | 2100 | 6830 |   —  |   —  | 0.01 |
+|  4096 |  98 | 408 | 1232 | 3836 |   —  |   —  | 0.12 |
+| 32768 |   — |   — |   — |   — |   —  |   —  |   —  |
+| 98304 |   — |   — |   — |   — |   —  |   —  |   —  |
 
 ### vLLM (gpt-oss-20b) — bigger model, different architecture
 
-| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 | prefill (s) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 | 47 | 175 |  530 | 1706 | 0.03 |
-|  4096 | 42 | 156 |  518 | 1386 | 0.55 |
+| prefix tokens |   N=1 |   N=4 |  N=16 |  N=64 |  N=256 |  N=1024 | prefill (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+|     1 |  47 | 175 |  530 | 1706 |   —  |   —  | 0.03 |
+|  4096 |  42 | 156 |  518 | 1386 |   —  |   —  | 0.55 |
+| 32768 |   — |   — |   — |   — |   —  |   —  |   —  |
+| 98304 |   — |   — |   — |   — |   —  |   —  |   —  |
 
-## What the gap looks like
+## What the gap looks like (after v5 optimisations)
 
 vLLM-Qwen3 / Ours-Qwen3, same model, same hardware:
 
 | prefix tokens |  N=1 |  N=4 | N=16 | N=64 | prefill |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1 | 1.9× | 3.0× |  5.2× | 11.9× | ~2× |
-|  4096 | 2.9× | 7.6× | 19.9× | 147.5× | ~2× |
+|     1 | 1.9× | 3.0× |  4.6× |  8.2× | ~2× |
+|  4096 | 2.1× | 4.6× | 10.8× | 36.9× | ~2.4× |
 
-We're 2-3× slower at concurrency 1 (small constant overhead per step), but
-the gap explodes with batch size and prefix length. The L=4096 N=64 cell is
-particularly bad (26 vs 3,836 tok/s — 147×).
+We're 2-3× slower at concurrency 1 (Python+launch overhead per step). The
+gap widens with concurrency at long prefix because vLLM has fused paged
+attention while ours is gather + SDPA. L=4096 N=64 went from a 147× gap
+in v1 to a 37× gap in v5.
 
 ## Why we're slow
 

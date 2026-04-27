@@ -72,9 +72,7 @@ def build_inputs(
             slot_mapping.append(
                 _absolute_slot(seq.block_table[block_idx], slot, block_size)
             )
-        block_tables.append(
-            torch.tensor(seq.block_table, dtype=torch.long, device=device)
-        )
+        block_tables.append(seq.block_table_tensor(device))
         seq_lens.append(total_len)
         query_lens.append(q_len)
 

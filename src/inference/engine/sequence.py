@@ -11,6 +11,8 @@ import enum
 import itertools
 from dataclasses import dataclass, field
 
+import torch
+
 from inference.config import SamplingParams
 
 
@@ -38,6 +40,22 @@ class Sequence:
     status: SeqStatus = SeqStatus.WAITING
     cumulative_logprob: float = 0.0
     finish_reason: str | None = None  # "length" | "stop" | "eos"
+
+    # Cached on-device tensor of `block_table`. Rebuilt only when the table
+    # actually grows (~once per `block_size` decode steps), not every step.
+    # Hot-path optimisation — see model_runner.build_inputs.
+    _block_table_tensor: torch.Tensor | None = field(default=None, repr=False)
+    _cached_block_table_len: int = field(default=0, repr=False)
+
+    def block_table_tensor(self, device: torch.device) -> torch.Tensor:
+        n = len(self.block_table)
+        cached = self._block_table_tensor
+        if cached is None or cached.device != device or self._cached_block_table_len != n:
+            self._block_table_tensor = torch.tensor(
+                self.block_table, dtype=torch.long, device=device
+            )
+            self._cached_block_table_len = n
+        return self._block_table_tensor
 
     @classmethod
     def new(cls, prompt: list[int], sampling: SamplingParams) -> Sequence:
